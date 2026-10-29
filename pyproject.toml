@@ -1,0 +1,17 @@
+[build-system]
+requires      = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "ohca"
+version         = "1.0.0"
+description     = "Loss-of-pulse detection from wrist PPG and accelerometry (BECA-S1, BECA-S2 + BECA-S6)."
+readme          = "README.md"
+license         = { file = "LICENSE" }
+authors         = [{ name = "Roelof G. Hup" }]
+requires-python = ">=3.9,<3.11"
+# The dependencies are pinned in requirements.txt.
+dependencies    = []
+
+[tool.setuptools.packages.find]
+include = ["ohca*"]
