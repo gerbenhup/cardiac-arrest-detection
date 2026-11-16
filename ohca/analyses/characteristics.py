@@ -80,7 +80,7 @@ class CharacteristicsAnalysis(Cached):
         "bmi":                    "BMI (kg/m²)",
         "skin_tone_num":          "Skin tone (I→VI)",
         "wrist_circumference_cm": "Wrist circumference (cm)",
-        "icd_test":               "Procedure type\n(ICD-test vs. ablation)",
+        "icd_test":               "Procedure type\n(DFT testing vs.\ncatheter ablation)",
     }
     XLABEL       = "Average marginal effect\n(percentage points)"
     PANEL_XLABEL = "Average marginal effect\n(PR-AUC percentage points)"   # next to another cohort's panel
