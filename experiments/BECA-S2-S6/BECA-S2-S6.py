@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import h5py
 import matplotlib.pyplot as plt
+from matplotlib.patches import ConnectionPatch, Rectangle
 import numpy as np
 import pandas as pd
 import scipy.signal
@@ -574,81 +575,107 @@ class BecaS2S6Dataset(dataset.H5Dataset):
         return df
 
 
-# Example figure: cathlab ECG, PPG and accelerometry around one shock-induced loss of pulse: the longest
-# shock-preceded event of the one ICD-test patient whose cathlab recording covers its own events.
+# Example figure: cathlab ECG, PPG and accelerometry around one shock-induced loss of pulse of an ICD-test
+# patient whose cathlab recording covers its own events. The induction and the loss of pulse are read from
+# the ECG: the induction is the stimulation (the amplifier saturated by its AC waveform), the loss of pulse
+# runs from its end to the first QRS after VF. The window ends in loss of pulse; a zoom above the ECG shows
+# the induction waveform.
 
 EXAMPLE_PARTICIPANT   = "example_participant.txt"   # in the BECA-S2 raw data: a pseudonym stays with the data
+EXAMPLE_EVENT         = 2      # the participant's n-th shock-induced loss of pulse
 EXAMPLE_ECG_CHANNEL   = 1      # lead II
-EXAMPLE_ECG_SHIFT_S   = 3.0    # residual cath-to-wrist misalignment of this event, corrected by eye
-EXAMPLE_ARTIFACT_S    = 0.5    # the visible shock artifact outlasts the annotated shock
-EXAMPLE_X_LIM         = (-20.0, 15.0)
+EXAMPLE_ECG_SHIFT_S   = 0.60   # residual cath-to-wrist offset: the ECG-to-accelerometer lag at the stimulation onsets
+EXAMPLE_SAT_MV        = 5.0    # the cath amplifier saturates at 5.12 mV
+EXAMPLE_VF_END_RR_S   = 0.7    # the first QRS after VF: the first R peak at least this long after the previous one
+EXAMPLE_X_START       = -20.0
+EXAMPLE_END_BEFORE_S  = 0.25   # the window ends this long before that QRS
+EXAMPLE_IND_MARGIN_S  = 0.3    # the induction shade extends this far beyond the stimulation, for visibility
+EXAMPLE_ECG_YLIM      = (-2.6, 5.8)   # holds the saturated amplifier
+EXAMPLE_ZOOM_MS       = 60.0   # of raw ECG mid-induction
+EXAMPLE_ZOOM_W_IN     = 2.10
+EXAMPLE_ZOOM_H_IN     = 0.62
+EXAMPLE_ZOOM_GAP_IN   = 0.36   # between the zoom and the ECG panel
+EXAMPLE_ZOOM_TITLE_IN = 0.20
 EXAMPLE_PPG_LEAD_IN_S = 120.0  # lets the high-pass filter settle before the window
-EXAMPLE_HEIGHT_IN     = 3.445
+EXAMPLE_HEIGHT_IN     = 3.445  # of the three signal panels with their margins
 EXAMPLE_GAP_V_IN      = 0.12
 EXAMPLE_LW            = 0.6
 
 
 def example_event_figure(spec: RunSpec, h5: dataset.H5Dataset) -> None:
 
-    raw     = BecaS2Raw(spec.base_dir / "raw_data" / "BECA-S2")
-    pid     = (raw.raw_dir / EXAMPLE_PARTICIPANT).read_text().strip()
-    t0      = BecaS2Raw.t0_of(raw.records().loc[pid])
-    eps     = sorted(raw.raw_episodes(pid))
-    pairs   = [(prev, ep) for prev, ep in zip(eps, eps[1:])
-               if ep[2] == POSITIVE_KIND and prev[2] == GAP_KIND]
-    shock, lop = max(pairs, key=lambda p: p[1][1] - p[1][0])
-    onset      = lop[0] + datetime.timedelta(seconds=EXAMPLE_ARTIFACT_S)
-    win_start  = onset + datetime.timedelta(seconds=EXAMPLE_X_LIM[0] - 5.0)
-    win_end    = onset + datetime.timedelta(seconds=EXAMPLE_X_LIM[1] + 5.0)
+    raw   = BecaS2Raw(spec.base_dir / "raw_data" / "BECA-S2")
+    pid   = (raw.raw_dir / EXAMPLE_PARTICIPANT).read_text().strip()
+    t0    = BecaS2Raw.t0_of(raw.records().loc[pid])
+    eps   = sorted(raw.raw_episodes(pid))
+    pairs = [(prev, ep) for prev, ep in zip(eps, eps[1:]) if ep[2] == POSITIVE_KIND and prev[2] == GAP_KIND]
+    shock, lop = pairs[EXAMPLE_EVENT - 1]
 
-    def rel(t: datetime.datetime) -> float:
-        return (t - onset).total_seconds()
+    def sec(t: datetime.datetime) -> float:
+        # Seconds since t0 on the wrist clock.
+        return (t - t0).total_seconds()
 
-
-    # Cathlab ECG: wrist time to cath time with the offset of the cath segment holding the event.
-    segs = pd.read_csv(raw.data_dir / pid / "Cath" / "segment_timestamps_corrected.csv", encoding="utf-8-sig")
-    segs["Corrected start time"] = pd.to_datetime(segs["Corrected start time"])
-    segs["Corrected end time"]   = pd.to_datetime(segs["Corrected end time"])
+    # Cathlab ECG on the wrist clock: the offset of the cath segment holding the event, plus the residual.
+    segs    = pd.read_csv(raw.data_dir / pid / "Cath" / "segment_timestamps_corrected.csv", encoding="utf-8-sig")
     offsets = raw.cath_offsets(pid)
-    offset  = next(off for (s, e), off in offsets.items()
-                   if any((segs["Sample start index"] == s) & (segs["Sample end index"] == e)
-                          & (segs["Corrected start time"] <= onset - datetime.timedelta(seconds=off))
-                          & (onset - datetime.timedelta(seconds=off) <= segs["Corrected end time"])))
-    cath_fs = raw.cath_sampling_rate(pid)
-
-    def cath_index(t: datetime.datetime) -> int:
-        t = t - datetime.timedelta(seconds=offset)
-        r = segs[(segs["Corrected start time"] <= t) & (t <= segs["Corrected end time"])].iloc[0]
-        frac = ((t - r["Corrected start time"]).total_seconds()
-                / (r["Corrected end time"] - r["Corrected start time"]).total_seconds())
-        return int(round(r["Sample start index"] + frac * (r["Sample end index"] - r["Sample start index"])))
-
-    shift = datetime.timedelta(seconds=EXAMPLE_ECG_SHIFT_S)
-    i0, i1 = cath_index(win_start - shift), cath_index(win_end + shift)
+    spans   = []
+    for _, r in segs.iterrows():
+        key = (int(r["Sample start index"]), int(r["Sample end index"]))
+        cs  = sec(pd.to_datetime(r["Corrected start time"])) + offsets[key] + EXAMPLE_ECG_SHIFT_S
+        ce  = sec(pd.to_datetime(r["Corrected end time"]))   + offsets[key] + EXAMPLE_ECG_SHIFT_S
+        spans.append((key, cs, ce))
+    key, cs, ce = next(s for s in spans if s[1] <= sec(shock[0]) and sec(lop[1]) <= s[2])
+    rate   = (key[1] - key[0]) / (ce - cs)
+    a_s    = sec(shock[0]) - 40.0
+    b_s    = sec(lop[1]) + 40.0
+    i0, i1 = int((a_s - cs) * rate) + key[0], int((b_s - cs) * rate) + key[0]
     ecg    = pd.read_csv(raw.data_dir / pid / "Cath" / "data.txt", sep=r"\s+", header=None, skiprows=i0,
                          nrows=i1 - i0, usecols=[EXAMPLE_ECG_CHANNEL]).values[:, 0]
-    t_ecg  = (np.arange(i0, i1) - cath_index(onset)) / cath_fs - EXAMPLE_ECG_SHIFT_S
+    te     = cs + (np.arange(i0, i1) - key[0]) / rate
+
+    # Induction: the longest saturated run (runs < 50 ms apart merged), ending at the last dip of the AC
+    # waveform; the amplifier stays saturated a while longer.
+    sat  = np.abs(ecg) >= EXAMPLE_SAT_MV
+    d    = np.diff(np.concatenate([[0], sat.astype(int), [0]]))
+    runs: List[Tuple[int, int]] = []
+    for s, e in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)):
+        if runs and s - runs[-1][1] < 0.05 * rate:
+            runs[-1] = (runs[-1][0], e)
+        else:
+            runs.append((s, e))
+    s, e    = max(runs, key=lambda q: q[1] - q[0])
+    dips    = s + np.flatnonzero(ecg[s:e] < EXAMPLE_SAT_MV - 1.0)
+    ind0, ind1, sat_end = te[s], te[dips[-1]], te[e - 1]
+    # Loss of pulse: from the end of the induction to the first QRS after VF.
+    xf     = scipy.signal.sosfiltfilt(scipy.signal.butter(3, [5, 30], btype="band", output="sos", fs=rate), ecg)
+    pk, _  = scipy.signal.find_peaks(xf, distance=int(0.3 * rate), prominence=0.4)
+    rt     = te[pk][te[pk] > sat_end + 1.0]
+    lop1   = next(b for a, b in zip(rt, rt[1:]) if b - a >= EXAMPLE_VF_END_RR_S)
+    onset  = ind1
+    x_lim  = (EXAMPLE_X_START, lop1 - onset - EXAMPLE_END_BEFORE_S)
 
     # Wrist: the features' PPG normalisation and causal high-pass; accelerometry in m/s^2.
-    fs      = dataset.FS
-    sig     = raw.read_signals(pid, raw.sides()[pid])
+    fs  = dataset.FS
+    sig = raw.read_signals(pid, raw.sides()[pid])
 
-    def index(t: datetime.datetime) -> int:
-        return int(round((t - t0).total_seconds() * fs))
+    def index(t: float) -> int:
+        return int(round(t * fs))
 
-    j_buf   = index(win_start - datetime.timedelta(seconds=EXAMPLE_PPG_LEAD_IN_S))
-    j0, j1  = index(win_start), index(win_end)
+    w0, w1  = onset + x_lim[0] - 5.0, onset + x_lim[1] + 5.0
+    j_buf   = index(w0 - EXAMPLE_PPG_LEAD_IN_S)
+    j0, j1  = index(w0), index(w1)
     ppg_raw = features.normalized_ppg(sig[j_buf:j1])[:, 0]
     ppg     = scipy.signal.sosfilt(features.FeatureExtractor().ppg_ac_filter, ppg_raw)[j0 - j_buf:]
     acc     = sig[j0:j1, 4:7] / ACC_LSB_PER_G * G
-    t_wrist = (np.arange(j0, j1) - index(onset)) / fs
+    t_wrist = np.arange(j0, j1) / fs - onset
 
-    # The study's figure width and the margins of the combined summary figure.
+    # The study's figure width and the margins of the combined summary figure; the zoom above the panels.
     width   = spec.figure_width_in
     panel_w = width - summary_figure.MARGIN_LEFT_IN - summary_figure.MARGIN_RIGHT_IN
     panel_h = (EXAMPLE_HEIGHT_IN - summary_figure.MARGIN_BOTTOM_IN - 2 * EXAMPLE_GAP_V_IN
                - summary_figure.MARGIN_TOP_IN) / 3
-    height = summary_figure.MARGIN_BOTTOM_IN + 3 * panel_h + 2 * EXAMPLE_GAP_V_IN + summary_figure.MARGIN_TOP_IN
+    top     = summary_figure.MARGIN_BOTTOM_IN + 3 * panel_h + 2 * EXAMPLE_GAP_V_IN
+    height  = top + EXAMPLE_ZOOM_GAP_IN + EXAMPLE_ZOOM_H_IN + EXAMPLE_ZOOM_TITLE_IN + summary_figure.MARGIN_TOP_IN
     fig     = plt.figure(figsize=(width, height), dpi=plotting.DPI)
     axes    = []
     for row in range(3):
@@ -657,32 +684,62 @@ def example_event_figure(spec: RunSpec, h5: dataset.H5Dataset) -> None:
                                  sharex=axes[0] if axes else None))
     ax_ecg, ax_ppg, ax_acc = axes
 
-    ax_ecg.plot(t_ecg,   ecg, color="tab:blue", lw=EXAMPLE_LW)
+    t_ecg = te - onset
+    shown = (t_ecg > x_lim[0] - 1) & (t_ecg < x_lim[1] + 1)
+    ax_ecg.plot(t_ecg[shown], ecg[shown], color="tab:blue", lw=EXAMPLE_LW)
     ax_ppg.plot(t_wrist, ppg, color="tab:blue", lw=EXAMPLE_LW)
-    for k in range(3):
-        ax_acc.plot(t_wrist, acc[:, k], lw=EXAMPLE_LW)
-    ax_ecg.set_ylim(-2, 2)
+    for k, axis in enumerate("xyz"):
+        ax_acc.plot(t_wrist, acc[:, k], lw=EXAMPLE_LW, label=axis)
+    ax_ecg.set_ylim(*EXAMPLE_ECG_YLIM)
+    ax_ecg.set_yticks([-2, 0, 2, 4])
     ax_ppg.set_ylim(-5, 5)
     ax_acc.set_ylim(-13, 13)
-    ax_acc.set_xlim(*EXAMPLE_X_LIM)
+    ax_acc.set_xlim(*x_lim)
     ax_ecg.set_ylabel("ECG (mV)",                fontsize=plotting.FONT_AXIS)
     ax_ppg.set_ylabel("PPG (a.u.)",              fontsize=plotting.FONT_AXIS)
     ax_acc.set_ylabel("Acceleration\n(m/s$^2$)", fontsize=plotting.FONT_AXIS)
     ax_acc.set_xlabel("Time relative to cardiac arrest onset (s)", fontsize=plotting.FONT_AXIS)
+    ax_acc.legend(loc="lower left", ncol=3, fontsize=plotting.FONT_LEGEND, frameon=False, handlelength=1.2,
+                  columnspacing=0.8, borderaxespad=0.2)
 
-    shock_span, lop_span = (rel(shock[0]), 0.0), (0.0, rel(lop[1]))
+    g0, g1 = ind0 - onset - EXAMPLE_IND_MARGIN_S, EXAMPLE_IND_MARGIN_S
     for ax in axes:
-        ax.axvspan(*shock_span, color="tab:green", alpha=0.20, lw=0)
-        ax.axvspan(*lop_span,   color="tab:red",   alpha=0.20, lw=0)
+        ax.axvspan(g0, g1,       color="tab:green", alpha=0.20, lw=0)
+        ax.axvspan(g1, x_lim[1], color="tab:red",   alpha=0.20, lw=0)
         ax.tick_params(labelsize=plotting.FONT_TICK)
         ax.grid(True, alpha=0.3, linewidth=0.4)
     for ax in axes[:-1]:
         ax.tick_params(labelbottom=False)
-    for text, (x0, x1), color in (("Shock", shock_span, "tab:green"),
-                                  ("Loss of pulse", (lop_span[0], min(lop_span[1], EXAMPLE_X_LIM[1])), "tab:red")):
-        ax_ecg.annotate(text, xy=((x0 + x1) / 2, 1), xycoords=("data", "axes fraction"), xytext=(0, 3),
-                        textcoords="offset points", ha="center", va="bottom", fontsize=plotting.FONT_AXIS,
-                        color=color)
+    ax_ecg.annotate("Loss of pulse", xy=((g1 + x_lim[1]) / 2, 1), xycoords=("data", "axes fraction"),
+                    xytext=(0, 3), textcoords="offset points", ha="center", va="bottom",
+                    fontsize=plotting.FONT_AXIS, color="tab:red")
+
+    # Zoom above the ECG panel, centred over the induction: EXAMPLE_ZOOM_MS of raw ECG mid-induction.
+    mid_t = (ind0 + ind1) / 2
+    x_in  = summary_figure.MARGIN_LEFT_IN + ((g0 + g1) / 2 - x_lim[0]) / (x_lim[1] - x_lim[0]) * panel_w
+    zx    = min(max(x_in - EXAMPLE_ZOOM_W_IN / 2, summary_figure.MARGIN_LEFT_IN),
+                width - summary_figure.MARGIN_RIGHT_IN - EXAMPLE_ZOOM_W_IN)
+    zoom  = fig.add_axes([zx / width, (top + EXAMPLE_ZOOM_GAP_IN) / height, EXAMPLE_ZOOM_W_IN / width,
+                          EXAMPLE_ZOOM_H_IN / height])
+    z     = (te >= mid_t) & (te <= mid_t + EXAMPLE_ZOOM_MS / 1000)
+    zoom.plot((te[z] - mid_t) * 1000, ecg[z], color="tab:blue", lw=EXAMPLE_LW * 0.9, marker=".", ms=1.2)
+    zoom.axvspan(0, EXAMPLE_ZOOM_MS, color="tab:green", alpha=0.20, lw=0)
+    zoom.set_xlim(0, EXAMPLE_ZOOM_MS)
+    zoom.set_ylim(-3.2, 6.2)
+    zoom.set_xticks([0, 20, 40, 60])
+    zoom.set_yticks([-2, 0, 2, 4])
+    zoom.tick_params(labelsize=plotting.FONT_TICK - 1, length=2, pad=1)
+    zoom.set_xlabel("ms", fontsize=plotting.FONT_TICK - 1, labelpad=0)
+    for spine in zoom.spines.values():
+        spine.set_linewidth(0.6)
+    zoom.set_title("Induction", fontsize=plotting.FONT_AXIS, color="tab:green", pad=3)
+
+    # The zoomed stretch on the ECG, joined to the zoom's lower corners.
+    bx, by, bw, bh = mid_t - onset, -2.45, EXAMPLE_ZOOM_MS / 1000, 7.75
+    ax_ecg.add_patch(Rectangle((bx, by), bw, bh, fill=False, edgecolor="0.25", lw=0.6, zorder=4))
+    for xa, xb in ((0.0, bx), (1.0, bx + bw)):
+        fig.add_artist(ConnectionPatch(xyA=(xa, 0.0), coordsA=zoom.transAxes, xyB=(xb, by + bh),
+                                       coordsB=ax_ecg.transData, color="0.25", lw=0.6))
     fig.align_ylabels(axes)
     plotting.save(fig, spec.base_dir / "figures" / "example_event_signals")
 
